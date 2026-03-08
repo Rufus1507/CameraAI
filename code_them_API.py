@@ -1,4 +1,15 @@
 import os
+import glob as _glob
+import ctypes
+
+# Preload libcusparseLt.so.0 for Jetson Orin (JetPack 6 + pip torch)
+# Must be done BEFORE importing torch using ctypes.CDLL (LD_LIBRARY_PATH is too late)
+_matches = _glob.glob(os.path.expanduser(
+    "~/.local/lib/python*/site-packages/nvidia/cusparselt/lib/libcusparseLt.so.0"
+))
+if _matches:
+    ctypes.CDLL(_matches[0])
+
 os.environ["LD_PRELOAD"] = "/usr/lib/aarch64-linux-gnu/libgomp.so.1"
 import torch
 from ultralytics import YOLO
@@ -9,7 +20,9 @@ from queue import Queue
 import signal
 import sys
 import requests
-
+import numpy as np
+import paho.mqtt.client as mqtt
+import json
 # ================= CHECK GPU =================
 DEVICE = 0   # TensorRT device id
 MODEL_PATH = "yolov8n.engine"
@@ -29,10 +42,14 @@ QUEUE_PER_CAM = 2     # 🔥 quan trọng: nhỏ để realtime
 LOG_INTERVAL = 0.5
 LOG_FILE = "camera_stats.csv"
 
-# ================= API CONFIG =================
-API_URL = "http://192.168.58.3:8000/api/camera_stats"
-API_SEND_INTERVAL = 0.5  # Gửi API mỗi 0.5 giây
-
+# ================= MQTT CONFIG =================
+MQTT_BROKER = "100.82.253.83"
+MQTT_PORT = 1883
+MQTT_TOPIC = "camera/stats"
+CLIENT_ID = "machine_a_camera_ai"
+API_SEND_INTERVAL = 0.5
+# Khởi tạo client với paho-mqtt v2 API
+mqtt_client = mqtt.Client(client_id=CLIENT_ID, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
 
 
 # ================= INIT LOG FILE =================
@@ -61,12 +78,30 @@ frame_queues = {
     for vid in range(TOTAL_VIDEO)
 }
 
-# ================= DAY / NIGHT (0 = tối, 1 = sáng) =================
+# ================= DAY / NIGHT =================
 def get_brightness(frame):
-    """Trả về độ sáng 0 → 1 (0 = tối nhất, 1 = sáng nhất)"""
+    """Trả về nhãn độ sáng: 0=tối/hồng ngoại | 1=mờ | 2=trung bình | 3=sáng"""
+
+    # --- Phát hiện chế độ hồng ngoại (IR) ---
+    # Khi bật IR, camera chuyển sang ảnh xám → saturation gần bằng 0
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mean_saturation = hsv[:, :, 1].mean()
+    if mean_saturation < 20:   # ngưỡng: < 20/255 ≈ ảnh xám = đang bật IR
+        return "0"             # coi như ban đêm / tối
+
+    # --- Tính độ sáng bình thường (ban ngày) ---
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    brightness = gray.mean() / 255.0  # Chuẩn hóa về 0-1
-    return round(brightness, 2)
+    p10, p50, p90 = np.percentile(gray, [10, 50, 90])
+    brightness = p50 * 0.5 + (p10 + p90) * 0.25
+
+    if brightness < 45:
+        return "0"   # tối (ban đêm, không đèn)
+    elif brightness < 85:
+        return "1"   # mờ (hoàng hôn, ánh đèn đường)
+    elif brightness < 145:
+        return "2"   # trung bình (trong nhà, trời흐림)
+    else:
+        return "3"   # sáng (ban ngày, đủ ánh sáng)
 
 # ================= SINGLE RTSP WORKER =================
 def single_rtsp_worker():
@@ -165,56 +200,52 @@ def log_writer_worker():
         with open(LOG_FILE, "w", buffering=1) as f:
             f.writelines(lines)
 
-# ================= API SENDER =================
-def api_sender_worker():
-    """Gửi dữ liệu camera đến FastAPI server"""
+# ================= MQTT SENDER =================
+def mqtt_sender_worker():
+    """Gửi dữ liệu camera qua MQTT, tự reconnect nếu mất kết nối"""
+    connected = False
     while True:
+        # Kết nối (hoặc reconnect) nếu chưa connected
+        if not connected:
+            try:
+                mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+                mqtt_client.loop_start()
+                connected = True
+                print(f"✅ Đã kết nối MQTT broker: {MQTT_BROKER}")
+            except Exception as e:
+                print(f"⚠️  MQTT chưa kết nối được: {e} — thử lại sau 5s")
+                time.sleep(5)
+                continue
+
         time.sleep(API_SEND_INTERVAL)
         try:
             with state_lock:
-                # Tạo payload từ camera_state
                 payload = {
                     "cameras": [
                         {
-                            "cam_id": vid,
+                            "cam_id": str(vid),
                             "timestamp": camera_state[vid]["timestamp"],
                             "fps": camera_state[vid]["fps"],
                             "people": camera_state[vid]["people"],
-                            "brightness": camera_state[vid]["is_night"],
+                            "light_level": int(camera_state[vid]["is_night"])
                         }
                         for vid in range(TOTAL_VIDEO)
                     ]
                 }
-            
-            # Gửi POST request đến API
-            response = requests.post(
-                API_URL,
-                json=payload,
-                timeout=2  # Timeout 2 giây
-            )
-            
-            if response.status_code == 200:
-                pass  # Thành công, không log để tránh spam
-            else:
-                print(f"⚠️ API response: {response.status_code}")
-                
-        except requests.exceptions.ConnectionError:
-            print("❌ Không kết nối được API server")
-        except requests.exceptions.Timeout:
-            print("⏱️ API timeout")
-        except Exception as e:
-            print(f"❌ API error: {e}")
 
+            mqtt_client.publish(MQTT_TOPIC, json.dumps(payload), qos=1)
+
+        except Exception as e:
+            print(f"❌ MQTT send error: {e}")
+            connected = False  # Báo mất kết nối để vòng lặp reconnect
 # ================= START =================
 threading.Thread(target=single_rtsp_worker, daemon=True).start()
 threading.Thread(target=yolo_worker, daemon=True).start()
 threading.Thread(target=log_writer_worker, daemon=True).start()
-threading.Thread(target=api_sender_worker, daemon=True).start()
+threading.Thread(target=mqtt_sender_worker, daemon=True).start()
 
 print("✅ Camera AI pipeline started (ROUND ROBIN MODE)")
 print(f"📹 Tổng số camera ảo: {TOTAL_VIDEO}")
-print(f"📡 API endpoint: {API_URL}")
-
 # ================= SIGNAL HANDLER =================
 running = True
 def signal_handler(sig, frame):
@@ -229,4 +260,6 @@ while running:
     time.sleep(1)
 
 print("👋 Đã tắt chương trình an toàn.")
-sys.exit(0)
+time.sleep(0.5)  # Cho threads TRT/CUDA có thời gian dừng
+os._exit(0)      # Dùng os._exit để tránh lỗi FATAL khi TRT cleanup
+

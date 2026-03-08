@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+env/
+.venv/
+
+# AI Models & Weights (Large files)
+*.pt
+*.onnx
+*.engine
+weights/
+
+# Data generated during runtime
+*.csv
+camera_stats.csv
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
