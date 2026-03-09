@@ -1,9 +1,9 @@
 import os
 import glob as _glob
 import ctypes
+import logging
 
-# Preload libcusparseLt.so.0 for Jetson Orin (JetPack 6 + pip torch)
-# Must be done BEFORE importing torch using ctypes.CDLL (LD_LIBRARY_PATH is too late)
+# ── Preload libcusparseLt.so.0 for Jetson Orin (BEFORE importing torch) ──────
 _matches = _glob.glob(os.path.expanduser(
     "~/.local/lib/python*/site-packages/nvidia/cusparselt/lib/libcusparseLt.so.0"
 ))
@@ -11,208 +11,341 @@ if _matches:
     ctypes.CDLL(_matches[0])
 
 os.environ["LD_PRELOAD"] = "/usr/lib/aarch64-linux-gnu/libgomp.so.1"
+
+# ── Tắt spam H264 decode error từ FFmpeg / OpenCV ────────────────────────────
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"   # chặn warn-level từ OpenCV
+logging.getLogger("libav").setLevel(logging.CRITICAL)
+
 import torch
 from ultralytics import YOLO
 import cv2
 import time
 import threading
-from queue import Queue
+from queue import Queue, Empty
 import signal
-import sys
 import requests
 import numpy as np
 import asyncio
 from amqtt.client import MQTTClient
 import json
-# ================= CHECK GPU =================
-DEVICE = 0   # TensorRT device id
+import sqlite3
+
+# ── Suppress verbose FFmpeg output at C level ─────────────────────────────────
+try:
+    import ctypes as _ct
+    _libav = _ct.cdll.LoadLibrary("libavcodec.so")
+    # AV_LOG_ERROR = 16, AV_LOG_QUIET = -8
+    _libav.av_log_set_level(16)
+except Exception:
+    pass
+
+# =============================================================================
+# DATABASE
+# =============================================================================
+DB_PATH = "cameras.db"
+
+def load_cameras():
+    """Đọc danh sách camera đang bật từ DB."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT cam_id, rtsp_url
+            FROM cameras
+            WHERE enabled = 1
+            ORDER BY cam_id
+        """)
+        rows = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"⚠️  load_cameras error: {e}")
+        return []
+
+    return [{"id": cam_id, "rtsp": rtsp_url} for cam_id, rtsp_url in rows]
+
+# =============================================================================
+# GPU / MODEL
+# =============================================================================
+DEVICE     = 0
 MODEL_PATH = "yolov8n.engine"
-model = YOLO(MODEL_PATH, task="detect")
+model      = YOLO(MODEL_PATH, task="detect")
 torch.backends.cudnn.benchmark = True
 
-# ================= CONFIG =================
-TOTAL_VIDEO = 25
-DETECT_FPS = 100
-RESIZE = (416, 416)   # tốt hơn cho Nano
-BATCH_SIZE = 1        # RTX 2050 safe
-RTSP_URL = "rtsp://100.82.253.83:8554/cam"
+# =============================================================================
+# CONFIG
+# =============================================================================
+DETECT_FPS  = 8           # frame gửi vào queue mỗi cam (giảm xuống để realtime hơn)
+RESIZE      = (416, 416)
+BATCH_SIZE  = 1           # TRT engine export với batch=1 (static shape)
+QUEUE_PER_CAM = 2
 
-QUEUE_PER_CAM = 2     # 🔥 quan trọng: nhỏ để realtime
+RTSP_RETRY_DELAY = 10     # giây chờ trước khi reconnect
 
-# ================= LOG CONFIG =================
-LOG_INTERVAL = 0.5
-LOG_FILE = "camera_stats.csv"
+LOG_INTERVAL = 1.0        # ghi CSV mỗi 1 giây
+LOG_FILE     = "camera_stats.csv"
 
-# ================= MQTT CONFIG =================
-MQTT_BROKER = "100.82.253.83"
-MQTT_PORT = 1883
-MQTT_TOPIC = "camera/stats"
-CLIENT_ID = "machine_a_camera_ai"
-API_SEND_INTERVAL = 0.5
-MQTT_URI = f"mqtt://{MQTT_BROKER}:{MQTT_PORT}/"
+DB_POLL_INTERVAL = 10     # giây check cameras.db có thay đổi không
 
+# =============================================================================
+# MQTT CONFIG
+# =============================================================================
+MQTT_BROKER       = "100.82.253.83"
+MQTT_PORT         = 1883
+MQTT_TOPIC        = "camera/stats"
+CLIENT_ID         = "machine_a_camera_ai"
+API_SEND_INTERVAL = 1.0
+MQTT_URI          = f"mqtt://{MQTT_BROKER}:{MQTT_PORT}/"
 
-# ================= INIT LOG FILE =================
-if not os.path.exists(LOG_FILE):
-    with open(LOG_FILE, "w") as f:
-        f.write("timestamp,cam_id,fps,people,is_night\n")
+# =============================================================================
+# SHARED STATE  (tất cả đều protected bởi state_lock)
+# =============================================================================
+state_lock   = threading.Lock()
 
-# ================= CAMERA STATE =================
-init_time = int(time.time())
+CAMERAS      = load_cameras()
+CAM_IDS      = [c["id"] for c in CAMERAS]
+TOTAL_VIDEO  = len(CAM_IDS)
+
+init_time    = int(time.time())
 camera_state = {
-    vid: {
-        "timestamp": init_time,
-        "fps": 0.0,
-        "people": 0,
-        "is_night": 0,
-    }
-    for vid in range(TOTAL_VIDEO)
+    cid: {"timestamp": init_time, "fps": 0.0, "people": 0, "is_night": "0"}
+    for cid in CAM_IDS
 }
-state_lock = threading.Lock()
-last_log_time = {}
-last_time = {}
+frame_queues = {cid: Queue(maxsize=QUEUE_PER_CAM) for cid in CAM_IDS}
 
-# ================= QUEUE PER CAMERA =================
-frame_queues = {
-    vid: Queue(maxsize=QUEUE_PER_CAM)
-    for vid in range(TOTAL_VIDEO)
-}
+# dict để track thread sống: cam_id → threading.Event (stop-signal)
+cam_stop_events: dict[int, threading.Event] = {}
 
-# ================= DAY / NIGHT =================
-def get_brightness(frame):
-    """Trả về nhãn độ sáng: 0=tối/hồng ngoại | 1=mờ | 2=trung bình | 3=sáng"""
+last_detect_time: dict[int, float] = {}   # dùng để tính FPS
 
-    # --- Phát hiện chế độ hồng ngoại (IR) ---
-    # Khi bật IR, camera chuyển sang ảnh xám → saturation gần bằng 0
+# FPS smoothing: Exponential Moving Average
+FPS_EMA_ALPHA  = 0.3    # trọng số mẫu mới (0=bỏ qua hết, 1=tức thời)
+STALE_TIMEOUT  = 5.0   # giây: nếu camera không được detect → báo fps=0 trong log
+
+# =============================================================================
+# INIT LOG FILE
+# =============================================================================
+with open(LOG_FILE, "w") as f:
+    f.write("timestamp,cam_id,fps,people,is_night\n")
+
+# =============================================================================
+# DAY / NIGHT
+# =============================================================================
+def get_brightness(frame) -> str:
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    mean_saturation = hsv[:, :, 1].mean()
-    if mean_saturation < 20:   # ngưỡng: < 20/255 ≈ ảnh xám = đang bật IR
-        return "0"             # coi như ban đêm / tối
+    if hsv[:, :, 1].mean() < 20:
+        return "0"   # IR / tối
 
-    # --- Tính độ sáng bình thường (ban ngày) ---
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     p10, p50, p90 = np.percentile(gray, [10, 50, 90])
-    brightness = p50 * 0.5 + (p10 + p90) * 0.25
+    b = p50 * 0.5 + (p10 + p90) * 0.25
 
-    if brightness < 45:
-        return "0"   # tối (ban đêm, không đèn)
-    elif brightness < 85:
-        return "1"   # mờ (hoàng hôn, ánh đèn đường)
-    elif brightness < 145:
-        return "2"   # trung bình (trong nhà, trời흐림)
-    else:
-        return "3"   # sáng (ban ngày, đủ ánh sáng)
+    if   b < 45:  return "0"
+    elif b < 85:  return "1"
+    elif b < 145: return "2"
+    else:         return "3"
 
-# ================= SINGLE RTSP WORKER =================
-def single_rtsp_worker():
-    cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+# =============================================================================
+# RTSP WORKER  (1 thread / camera, có stop-event để DB watcher có thể kill)
+# =============================================================================
+def rtsp_worker(cam: dict, stop_event: threading.Event):
+    cam_id = cam["id"]
+    url    = cam["rtsp"]
 
+    # Interval giữa 2 frame gửi vào queue
+    send_interval = 1.0 / DETECT_FPS
 
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    while not stop_event.is_set():
+        # ── Mở RTSP ──────────────────────────────────────────────────────────
+        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    if not cap.isOpened():
-        print("❌ Không mở được RTSP")
-        return
-
-    last_sent = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            time.sleep(0.01)
+        if not cap.isOpened():
+            print(f"❌ Cam {cam_id}: không kết nối — thử lại sau {RTSP_RETRY_DELAY}s")
+            with state_lock:
+                if cam_id in camera_state:
+                    camera_state[cam_id]["fps"] = -1.0
+            cap.release()
+            stop_event.wait(timeout=RTSP_RETRY_DELAY)
             continue
 
-        now = time.time()
-        if now - last_sent < 1.0 / DETECT_FPS:
-            continue
-        last_sent = now
+        print(f"✅ Cam {cam_id}: kết nối RTSP thành công")
+        last_sent = 0.0
+        fail_count = 0
 
-        frame = cv2.resize(frame, RESIZE)
+        # ── Đọc frame ────────────────────────────────────────────────────────
+        while not stop_event.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                fail_count += 1
+                if fail_count >= 5:
+                    print(f"⚠️  Cam {cam_id}: mất kết nối — reconnect sau {RTSP_RETRY_DELAY}s")
+                    with state_lock:
+                        if cam_id in camera_state:
+                            camera_state[cam_id]["fps"] = -1.0
+                    cap.release()
+                    stop_event.wait(timeout=RTSP_RETRY_DELAY)
+                    break
+                time.sleep(0.02)
+                continue
 
-        # 🔥 fan-out cho 20 cam logic (DROP FRAME CŨ)
-        for vid in range(TOTAL_VIDEO):
-            q = frame_queues[vid]
-            if q.full():
-                q.get_nowait()
-            q.put(frame)
+            fail_count = 0
+            now = time.time()
+            if now - last_sent < send_interval:
+                continue
 
-# ================= YOLO WORKER (ROUND ROBIN) =================
+            last_sent = now
+            frame = cv2.resize(frame, RESIZE)
+
+            q: Queue = frame_queues.get(cam_id)
+            if q is not None:
+                if q.full():
+                    try: q.get_nowait()
+                    except Empty: pass
+                q.put_nowait(frame)
+
+        cap.release()
+
+    print(f"🔴 Cam {cam_id}: thread dừng")
+
+# =============================================================================
+# YOLO WORKER  — strict fair round-robin scheduling
+# =============================================================================
 def yolo_worker():
-    cam_cursor = 0
+    """
+    Mỗi lần gọi GPU inference = 1 lần quét hoàn chỉnh qua TẤT CẢ cameras
+    bắt đầu từ vị trí xoay vòng (start_idx).
+
+    Đảm bảo:
+    - Mỗi camera đóng góp TỐI ĐA 1 frame / batch.
+    - start_idx xoay sau mỗi batch → camera nào bị bỏ lần này sẽ được ưu tiên lần sau.
+    - Nếu tổng frame < BATCH_SIZE, chạy batch nhỏ hơn thay vì chờ hoặc thiên vị.
+    """
+    start_idx = 0   # xoay sau mỗi batch để cân bằng camera đứng đầu hàng
 
     while True:
-        frames = []
-        ids = []
+        # ── Snapshot danh sách camera hiện tại ───────────────────────────────
+        with state_lock:
+            cur_ids = list(CAM_IDS)
+        n = len(cur_ids)
+        if n == 0:
+            time.sleep(0.1)
+            continue
 
-        while len(frames) < BATCH_SIZE:
-            q = frame_queues[cam_cursor]
-            if not q.empty():
-                frame = q.get()
-                frames.append(frame)
-                ids.append(cam_cursor)
+        frames: list[np.ndarray] = []
+        ids:    list[int]        = []
+        last_i  = 0   # vị trí dừng để start_idx kế tiếp tiếp nối đúng chỗ
 
-            cam_cursor = (cam_cursor + 1) % TOTAL_VIDEO
-            time.sleep(0.001)
+        # ── 1 lần quét hoàn chỉnh qua tất cả n cameras ───────────────────────
+        for i in range(n):
+            cam_id = cur_ids[(start_idx + i) % n]
+            q: Queue = frame_queues.get(cam_id)
+            if q is not None and not q.empty():
+                try:
+                    frame = q.get_nowait()
+                    frames.append(frame)
+                    ids.append(cam_id)
+                    last_i = i
+                    if len(frames) >= BATCH_SIZE:
+                        # batch đầy → lần sau bắt đầu từ camera TIẾP THEO
+                        start_idx = (start_idx + last_i + 1) % n
+                        break
+                except Empty:
+                    pass
+        else:
+            # Đã quét hết vòng → lần sau bắt đầu lại từ đầu (xoay 1 bước)
+            start_idx = (start_idx + 1) % n
 
-        start = time.time()
+        # ── Không camera nào có frame → nghỉ ngắn ────────────────────────────
+        if not frames:
+            time.sleep(0.005)
+            continue
+
+        # ── GPU Inference ─────────────────────────────────────────────────────
         with torch.no_grad():
             batch_results = model.predict(
                 source=frames,
-                device=0,
+                device=DEVICE,
                 imgsz=416,
                 classes=[0],
                 verbose=False,
-                stream=False
+                stream=False,
             )
 
-        end = time.time()
+        # ── Cập nhật state cho từng camera trong batch ────────────────────────
+        now = time.time()
+        with state_lock:
+            for vid, res, frame in zip(ids, batch_results, frames):
+                prev = last_detect_time.get(vid)
+                last_detect_time[vid] = now
 
-        for vid, res, frame in zip(ids, batch_results, frames):
-            prev = last_time.get(vid)
-            fps = 1.0 / max(end - prev, 1e-6) if prev else 0.0
-            last_time[vid] = end
-            brightness = get_brightness(frame)
-            num_person = len(res.boxes) if res.boxes else 0
+                # FPS tức thời
+                instant_fps = 1.0 / max(now - prev, 1e-6) if prev else 0.0
 
-            now = time.time()
-            if now - last_log_time.get(vid, 0) >= LOG_INTERVAL:
-                last_log_time[vid] = now
-                with state_lock:
+                # EMA smoothing: tránh spike do jitter mạng
+                old_fps = camera_state[vid]["fps"] if vid in camera_state else 0.0
+                if old_fps <= 0:
+                    smoothed_fps = round(instant_fps, 2)          # lần đầu: lấy thẳng
+                else:
+                    smoothed_fps = round(
+                        FPS_EMA_ALPHA * instant_fps + (1 - FPS_EMA_ALPHA) * old_fps, 2
+                    )
+
+                num_person = len(res.boxes) if res.boxes else 0
+                brightness = get_brightness(frame)
+
+                if vid in camera_state:
                     camera_state[vid] = {
                         "timestamp": int(now),
-                        "fps": round(fps, 2),
-                        "people": num_person,
-                        "is_night": brightness,
+                        "fps":       smoothed_fps,
+                        "people":    num_person,
+                        "is_night":  brightness,
                     }
 
-# ================= LOG WRITER =================
+# =============================================================================
+# LOG WRITER
+# =============================================================================
 def log_writer_worker():
-    header = "timestamp,cam_id,fps,people,is_night\n"
     while True:
         time.sleep(LOG_INTERVAL)
+        now = time.time()
         with state_lock:
-            lines = [header]
-            for vid in range(TOTAL_VIDEO):
-                s = camera_state[vid]
-                lines.append(
-                    f"{s['timestamp']},{vid},{s['fps']},"
-                    f"{s['people']},{s['is_night']}\n"
-                )
-        with open(LOG_FILE, "w", buffering=1) as f:
-            f.writelines(lines)
+            cur_ids = list(CAM_IDS)
+            snapshot      = {cid: dict(camera_state[cid])  for cid in cur_ids if cid in camera_state}
+            last_det_snap = {cid: last_detect_time.get(cid) for cid in cur_ids}
 
-# ================= MQTT SENDER (AMQTT / asyncio) =================
+        lines = ["timestamp,cam_id,fps,people,is_night\n"]
+        for cid in sorted(cur_ids):
+            s    = snapshot.get(cid)
+            last = last_det_snap.get(cid)
+            if not s:
+                continue
+
+            # Nếu camera chưa được detect hoặc quá STALE_TIMEOUT → fps=0
+            stale = (last is None) or (now - last > STALE_TIMEOUT)
+            fps_out = 0.0 if stale else s["fps"]
+
+            lines.append(
+                f"{s['timestamp']},{cid},{fps_out},{s['people']},{s['is_night']}\n"
+            )
+
+        try:
+            with open(LOG_FILE, "w", buffering=1) as f:
+                f.writelines(lines)
+        except Exception as e:
+            print(f"❌ log_writer error: {e}")
+
+# =============================================================================
+# MQTT SENDER
+# =============================================================================
 async def _async_mqtt_sender():
-    """Coroutine gửi dữ liệu camera qua AMQTT, tự reconnect nếu mất kết nối"""
-    # reconnect_retries=0 → tắt auto-reconnect nội bộ của amqtt,
-    # để vòng while bên ngoài tự xử lý reconnect sạch hơn
     _cfg = {"reconnect_retries": 0, "reconnect_max_interval": 5}
     while True:
         client = MQTTClient(client_id=CLIENT_ID, config=_cfg)
         try:
             await client.connect(MQTT_URI)
-            print(f"✅ Đã kết nối MQTT broker (AMQTT): {MQTT_BROKER}")
+            print(f"✅ Đã kết nối MQTT broker: {MQTT_BROKER}")
         except Exception as e:
-            print(f"⚠️  AMQTT chưa kết nối được: {e} — thử lại sau 5s")
+            print(f"⚠️  MQTT chưa kết nối: {e} — thử lại sau 5s")
             await asyncio.sleep(5)
             continue
 
@@ -220,25 +353,22 @@ async def _async_mqtt_sender():
             while True:
                 await asyncio.sleep(API_SEND_INTERVAL)
                 with state_lock:
+                    cur_ids = list(CAM_IDS)
                     payload = {
                         "cameras": [
                             {
-                                "cam_id": str(vid),
-                                "timestamp": camera_state[vid]["timestamp"],
-                                "fps": camera_state[vid]["fps"],
-                                "people": camera_state[vid]["people"],
-                                "light_level": int(camera_state[vid]["is_night"])
+                                "cam_id":      str(cid),
+                                "timestamp":   camera_state[cid]["timestamp"],
+                                "fps":         camera_state[cid]["fps"],
+                                "people":      camera_state[cid]["people"],
+                                "light_level": int(camera_state[cid]["is_night"]),
                             }
-                            for vid in range(TOTAL_VIDEO)
+                            for cid in cur_ids if cid in camera_state
                         ]
                     }
-                await client.publish(
-                    MQTT_TOPIC,
-                    json.dumps(payload).encode(),
-                    qos=0x01
-                )
+                await client.publish(MQTT_TOPIC, json.dumps(payload).encode(), qos=0x01)
         except Exception as e:
-            print(f"❌ AMQTT send error: {e} — reconnect sau 3s")
+            print(f"❌ MQTT send error: {e} — reconnect sau 3s")
             await asyncio.sleep(3)
         finally:
             try:
@@ -246,34 +376,102 @@ async def _async_mqtt_sender():
             except Exception:
                 pass
 
-
 def mqtt_sender_worker():
-    """Chạy async MQTT sender trong thread riêng với event loop của nó"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(_async_mqtt_sender())
-# ================= START =================
-threading.Thread(target=single_rtsp_worker, daemon=True).start()
-threading.Thread(target=yolo_worker, daemon=True).start()
-threading.Thread(target=log_writer_worker, daemon=True).start()
-threading.Thread(target=mqtt_sender_worker, daemon=True).start()
 
-print("✅ Camera AI pipeline started (ROUND ROBIN MODE)")
-print(f"📹 Tổng số camera ảo: {TOTAL_VIDEO}")
-# ================= SIGNAL HANDLER =================
+# =============================================================================
+# DB WATCHER  — hot-reload cameras.db mỗi DB_POLL_INTERVAL giây
+# =============================================================================
+def db_watcher_worker():
+    """
+    Mỗi DB_POLL_INTERVAL giây đọc lại cameras.db.
+    - Camera mới → tạo queue, state, khởi thread rtsp_worker mới
+    - Camera bị xóa/disable → gửi stop-event, dọn queue & state
+    """
+    global CAM_IDS, TOTAL_VIDEO
+
+    while True:
+        time.sleep(DB_POLL_INTERVAL)
+
+        new_cameras = load_cameras()
+        new_ids     = {c["id"] for c in new_cameras}
+        new_cam_map = {c["id"]: c for c in new_cameras}
+
+        with state_lock:
+            old_ids = set(CAM_IDS)
+
+        added   = new_ids - old_ids
+        removed = old_ids - new_ids
+
+        # ── Xử lý camera bị remove ────────────────────────────────────────────
+        for cid in removed:
+            evt = cam_stop_events.pop(cid, None)
+            if evt:
+                evt.set()   # báo thread dừng
+            with state_lock:
+                camera_state.pop(cid, None)
+                frame_queues.pop(cid, None)
+            print(f"🔴 DB watcher: cam {cid} bị xóa/disable")
+
+        # ── Xử lý camera mới ─────────────────────────────────────────────────
+        for cid in added:
+            cam = new_cam_map[cid]
+            with state_lock:
+                frame_queues[cid]  = Queue(maxsize=QUEUE_PER_CAM)
+                camera_state[cid]  = {
+                    "timestamp": int(time.time()),
+                    "fps": 0.0, "people": 0, "is_night": "0"
+                }
+            stop_evt = threading.Event()
+            cam_stop_events[cid] = stop_evt
+            threading.Thread(
+                target=rtsp_worker, args=(cam, stop_evt), daemon=True
+            ).start()
+            print(f"🟢 DB watcher: cam {cid} mới → khởi thread")
+
+        # ── Cập nhật CAM_IDS & TOTAL_VIDEO ───────────────────────────────────
+        if added or removed:
+            with state_lock:
+                CAM_IDS     = sorted(new_ids - removed | new_ids & old_ids)
+                TOTAL_VIDEO = len(CAM_IDS)
+            print(f"📋 DB watcher: tổng {TOTAL_VIDEO} cameras đang chạy")
+
+# =============================================================================
+# KHỞI ĐỘNG
+# =============================================================================
+# Stop-event cho các camera ban đầu
+for cam in CAMERAS:
+    evt = threading.Event()
+    cam_stop_events[cam["id"]] = evt
+    threading.Thread(target=rtsp_worker, args=(cam, evt), daemon=True).start()
+
+threading.Thread(target=yolo_worker,       daemon=True).start()
+threading.Thread(target=log_writer_worker, daemon=True).start()
+threading.Thread(target=mqtt_sender_worker,daemon=True).start()
+threading.Thread(target=db_watcher_worker, daemon=True).start()
+
+print("✅ Camera AI pipeline started")
+print(f"📹 Tổng số camera: {TOTAL_VIDEO}  |  Batch size: {BATCH_SIZE}  |  Detect FPS/cam: {DETECT_FPS}")
+print(f"🔄 DB hot-reload mỗi {DB_POLL_INTERVAL}s  |  Log interval: {LOG_INTERVAL}s")
+
+# =============================================================================
+# SIGNAL HANDLER
+# =============================================================================
 running = True
+
 def signal_handler(sig, frame):
     global running
     print("\n🛑 Đang tắt chương trình...")
     running = False
 
-signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGINT,  signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 while running:
     time.sleep(1)
 
 print("👋 Đã tắt chương trình an toàn.")
-time.sleep(0.5)  # Cho threads TRT/CUDA có thời gian dừng
-os._exit(0)      # Dùng os._exit để tránh lỗi FATAL khi TRT cleanup
-
+time.sleep(0.5)
+os._exit(0)
