@@ -21,7 +21,8 @@ import signal
 import sys
 import requests
 import numpy as np
-import paho.mqtt.client as mqtt
+import asyncio
+from amqtt.client import MQTTClient
 import json
 # ================= CHECK GPU =================
 DEVICE = 0   # TensorRT device id
@@ -48,8 +49,7 @@ MQTT_PORT = 1883
 MQTT_TOPIC = "camera/stats"
 CLIENT_ID = "machine_a_camera_ai"
 API_SEND_INTERVAL = 0.5
-# Khởi tạo client với paho-mqtt v2 API
-mqtt_client = mqtt.Client(client_id=CLIENT_ID, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+MQTT_URI = f"mqtt://{MQTT_BROKER}:{MQTT_PORT}/"
 
 
 # ================= INIT LOG FILE =================
@@ -200,44 +200,58 @@ def log_writer_worker():
         with open(LOG_FILE, "w", buffering=1) as f:
             f.writelines(lines)
 
-# ================= MQTT SENDER =================
-def mqtt_sender_worker():
-    """Gửi dữ liệu camera qua MQTT, tự reconnect nếu mất kết nối"""
-    connected = False
+# ================= MQTT SENDER (AMQTT / asyncio) =================
+async def _async_mqtt_sender():
+    """Coroutine gửi dữ liệu camera qua AMQTT, tự reconnect nếu mất kết nối"""
+    # reconnect_retries=0 → tắt auto-reconnect nội bộ của amqtt,
+    # để vòng while bên ngoài tự xử lý reconnect sạch hơn
+    _cfg = {"reconnect_retries": 0, "reconnect_max_interval": 5}
     while True:
-        # Kết nối (hoặc reconnect) nếu chưa connected
-        if not connected:
-            try:
-                mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-                mqtt_client.loop_start()
-                connected = True
-                print(f"✅ Đã kết nối MQTT broker: {MQTT_BROKER}")
-            except Exception as e:
-                print(f"⚠️  MQTT chưa kết nối được: {e} — thử lại sau 5s")
-                time.sleep(5)
-                continue
-
-        time.sleep(API_SEND_INTERVAL)
+        client = MQTTClient(client_id=CLIENT_ID, config=_cfg)
         try:
-            with state_lock:
-                payload = {
-                    "cameras": [
-                        {
-                            "cam_id": str(vid),
-                            "timestamp": camera_state[vid]["timestamp"],
-                            "fps": camera_state[vid]["fps"],
-                            "people": camera_state[vid]["people"],
-                            "light_level": int(camera_state[vid]["is_night"])
-                        }
-                        for vid in range(TOTAL_VIDEO)
-                    ]
-                }
-
-            mqtt_client.publish(MQTT_TOPIC, json.dumps(payload), qos=1)
-
+            await client.connect(MQTT_URI)
+            print(f"✅ Đã kết nối MQTT broker (AMQTT): {MQTT_BROKER}")
         except Exception as e:
-            print(f"❌ MQTT send error: {e}")
-            connected = False  # Báo mất kết nối để vòng lặp reconnect
+            print(f"⚠️  AMQTT chưa kết nối được: {e} — thử lại sau 5s")
+            await asyncio.sleep(5)
+            continue
+
+        try:
+            while True:
+                await asyncio.sleep(API_SEND_INTERVAL)
+                with state_lock:
+                    payload = {
+                        "cameras": [
+                            {
+                                "cam_id": str(vid),
+                                "timestamp": camera_state[vid]["timestamp"],
+                                "fps": camera_state[vid]["fps"],
+                                "people": camera_state[vid]["people"],
+                                "light_level": int(camera_state[vid]["is_night"])
+                            }
+                            for vid in range(TOTAL_VIDEO)
+                        ]
+                    }
+                await client.publish(
+                    MQTT_TOPIC,
+                    json.dumps(payload).encode(),
+                    qos=0x01
+                )
+        except Exception as e:
+            print(f"❌ AMQTT send error: {e} — reconnect sau 3s")
+            await asyncio.sleep(3)
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
+def mqtt_sender_worker():
+    """Chạy async MQTT sender trong thread riêng với event loop của nó"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_async_mqtt_sender())
 # ================= START =================
 threading.Thread(target=single_rtsp_worker, daemon=True).start()
 threading.Thread(target=yolo_worker, daemon=True).start()
