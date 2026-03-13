@@ -50,17 +50,27 @@ def load_cameras():
         conn = sqlite3.connect(DB_PATH)
         cur  = conn.cursor()
         cur.execute("""
-            SELECT cam_id, rtsp_url
+            SELECT device_id, device_name, ip_address, mac_address, mqtt_topic, status
             FROM cameras
-            WHERE enabled = 1
-            ORDER BY cam_id
+            WHERE status = 'online'
+            ORDER BY device_id
         """)
         rows = cur.fetchall()
         conn.close()
     except Exception as e:
         print(f"⚠️  load_cameras error: {e}")
         return []
-    return [{"id": cam_id, "rtsp": rtsp_url} for cam_id, rtsp_url in rows]
+    return [
+        {
+            "id":         row[0],
+            "name":       row[1],
+            "rtsp":       row[2],
+            "mac":        row[3],
+            "mqtt_topic": row[4],
+            "status":     row[5],
+        }
+        for row in rows
+    ]
 
 # =============================================================================
 # GPU / MODEL
@@ -100,9 +110,9 @@ DB_POLL_INTERVAL = 10       # giây check cameras.db có thay đổi không
 # =============================================================================
 # MQTT CONFIG
 # =============================================================================
-MQTT_BROKER       = "100.82.253.83"
+MQTT_BROKER       = "100.82.253.83"   # IP máy B — nơi chạy broker amqtt
 MQTT_PORT         = 1883
-MQTT_TOPIC        = "camera/stats"
+MQTT_TOPIC        = "camera/stats"    # fallback topic nếu cam chưa có topic riêng
 CLIENT_ID         = "machine_a_camera_ai"
 API_SEND_INTERVAL = 1.0
 MQTT_URI          = f"mqtt://{MQTT_BROKER}:{MQTT_PORT}/"
@@ -117,6 +127,8 @@ CAM_IDS      = [c["id"] for c in CAMERAS]
 TOTAL_VIDEO  = len(CAM_IDS)
 
 init_time    = int(time.time())
+# cam_topic_map: cam_id → mqtt_topic (đọc từ DB)
+cam_topic_map: dict[int, str] = {c["id"]: c["mqtt_topic"] for c in CAMERAS}
 camera_state = {
     cid: {"timestamp": init_time, "fps": 0.0, "people": 0, "is_night": "0"}
     for cid in CAM_IDS
@@ -374,23 +386,31 @@ async def _async_mqtt_sender():
                 now2    = time.time()
                 cutoff2 = now2 - FPS_WINDOW
                 with state_lock:
-                    cur_ids = list(CAM_IDS)
-                    payload = {
-                        "cameras": [
-                            {
-                                "cam_id":      str(cid),
-                                "timestamp":   camera_state[cid]["timestamp"],
-                                "fps":         round(
-                                    len([t for t in detect_timestamps.get(cid, []) if t > cutoff2]) / FPS_WINDOW, 2
-                                ),
-                                "people":      camera_state[cid]["people"],
-                                "light_level": int(camera_state[cid]["is_night"]),
-                            }
-                            for cid in cur_ids if cid in camera_state
-                        ]
+                    cur_ids   = list(CAM_IDS)
+                    snap_state = {cid: dict(camera_state[cid]) for cid in cur_ids if cid in camera_state}
+                    snap_fps   = {
+                        cid: round(
+                            len([t for t in detect_timestamps.get(cid, []) if t > cutoff2]) / FPS_WINDOW, 2
+                        )
+                        for cid in cur_ids
                     }
-                await client.publish(MQTT_TOPIC, json.dumps(payload).encode(), qos=0x01)
-                print(f"📤 Đã gửi MQTT: {len(payload['cameras'])} cameras tới {MQTT_TOPIC}")
+                    snap_topics = dict(cam_topic_map)
+
+                # Gửi mỗi camera lên topic riêng
+                sent = 0
+                for cid in cur_ids:
+                    if cid not in snap_state:
+                        continue
+                    topic = snap_topics.get(cid, MQTT_TOPIC)  # fallback về topic chung nếu chưa có
+                    s = snap_state[cid]
+                    payload = {
+                        "people":      s["people"],
+                        "light_level": int(s["is_night"]),
+                    }
+                    await client.publish(topic, json.dumps(payload).encode(), qos=0x01)
+                    sent += 1
+
+                print(f"📤 Đã gửi MQTT: {sent} cameras (mỗi cam 1 topic riêng)")
         except Exception as e:
             print(f"❌ MQTT send error: {e} — reconnect sau 3s")
             await asyncio.sleep(3)
@@ -434,6 +454,7 @@ def db_watcher_worker():
                 detect_timestamps.pop(cid, None)
                 people_history.pop(cid, None)
                 last_detect_time.pop(cid, None)
+                cam_topic_map.pop(cid, None)
             print(f"🔴 DB watcher: cam {cid} bị xóa/disable")
 
         for cid in added:
@@ -446,12 +467,13 @@ def db_watcher_worker():
                     "timestamp": int(time.time()),
                     "fps": 0.0, "people": 0, "is_night": "0"
                 }
+                cam_topic_map[cid]     = cam.get("mqtt_topic", MQTT_TOPIC)
             stop_evt = threading.Event()
             cam_stop_events[cid] = stop_evt
             threading.Thread(
                 target=rtsp_worker, args=(cam, stop_evt), daemon=True
             ).start()
-            print(f"🟢 DB watcher: cam {cid} mới → khởi thread")
+            print(f"🟢 DB watcher: cam {cid} mới → khởi thread (topic: {cam.get('mqtt_topic', MQTT_TOPIC)})")
 
         if added or removed:
             with state_lock:
